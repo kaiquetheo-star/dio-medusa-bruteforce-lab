@@ -32,10 +32,11 @@ O objetivo é **aprender para defender**: entender a lógica do "tentativa e err
 11. [Mitigação e boas práticas](#-mitigação-e-boas-práticas)
 12. [Ferramentas clássicas na era de IA e MFA](#-ferramentas-clássicas-na-era-de-ia-e-mfa)
 13. [Falsos-positivos](#-falsos-positivos)
-14. [Evidências](#-evidências)
-15. [Estrutura do repositório](#-estrutura-do-repositório)
-16. [Como reproduzir / publicar](#-como-reproduzir--publicar)
-17. [Referências](#-referências)
+14. [Ambiente das evidências (Docker)](#-ambiente-das-evidências-docker)
+15. [Evidências](#-evidências)
+16. [Estrutura do repositório](#-estrutura-do-repositório)
+17. [Como reproduzir / publicar](#-como-reproduzir--publicar)
+18. [Referências](#-referências)
 
 ---
 
@@ -78,7 +79,7 @@ Como bônus, o mesmo raciocínio é aplicado a **FTP** e a um **formulário web 
 | Papel | VM | IP (exemplo) | Serviços-alvo |
 |---|---|---|---|
 | Atacante | Kali Linux | `192.168.56.10` | medusa, nmap, enum4linux, smbclient |
-| Alvo | Metasploitable 2 | `192.168.56.20` | Samba (139/445), vsftpd (21), Apache+DVWA (80) |
+| Alvo | Metasploitable 2 | `192.168.56.20` | Samba (139/445), FTP (21 e 2121), Apache+DVWA (80) |
 
 > Os IPs acima são exemplos — os seus podem variar. Confirme com `ip a` (Kali) e `ifconfig` (Metasploitable).
 
@@ -292,7 +293,7 @@ Script da fase: [`scripts/03-validacao-smbclient.sh`](scripts/03-validacao-smbcl
 
 ## 🎁 Bônus A — Força bruta em FTP
 
-O Metasploitable 2 roda **vsftpd** na porta 21. O módulo do Medusa é o `ftp`:
+O Metasploitable 2 roda **FTP** na porta 21 (ProFTPD; há também um vsftpd clássico na porta 2121). O módulo do Medusa é o `ftp`:
 
 ```bash
 medusa -h 192.168.56.20 \
@@ -320,34 +321,49 @@ Script: [`scripts/04-bonus-ftp.sh`](scripts/04-bonus-ftp.sh)
 
 ## 🎁 Bônus B — Formulário web (DVWA)
 
-O Metasploitable 2 já traz o **DVWA (Damn Vulnerable Web Application)** em `http://<IP_DO_ALVO>/dvwa/` (login padrão: `admin` / `password` — configure **DVWA Security: Low**).
+O Metasploitable 2 já traz o **DVWA (Damn Vulnerable Web Application)** em `http://<IP_DO_ALVO>/dvwa/` (login padrão: `admin` / `password` — configure **DVWA Security: Low**; se todo login volta para `setup.php`, inicialize o banco em **setup.php → Create / Reset Database**).
 
-O Medusa tem o módulo `http` para formulários POST clássicos:
+O módulo correto do Medusa para formulários é o **`web-form`** (o módulo `http` é para *HTTP Basic Auth* — usá-lo em formulário gera uma chuva de falsos-positivos, como documentado abaixo):
 
 ```bash
 medusa -h 192.168.56.20 \
        -U wordlists/users.txt \
        -P wordlists/passwords.txt \
-       -M http \
-       -m PAGE:'/dvwa/login.php' \
-       -m FORM:'username=^USER^&password=^PASS^&Login=Login' \
+       -M web-form \
+       -m FORM:'/login.php' \
        -m DENY-SIGNAL:'Login failed' \
+       -m FORM-DATA:'post?username=&password=&Login=Login' \
        -t 4 -v 4
 ```
 
-- `PAGE` → endpoint que recebe o POST;
-- `FORM` → campos do formulário; `^USER^` e `^PASS^` são os placeholders do Medusa;
+- `FORM` → página que recebe o POST;
+- `FORM-DATA` → método e campos; o módulo preenche automaticamente o **1º campo com o usuário** e o **2º com a senha** de cada tentativa;
 - `DENY-SIGNAL` → texto presente na resposta quando o login **falha**.
 
-### ⚡ A limitação importante: token CSRF
+### ⚡ O que aconteceu de verdade no lab (3 lições)
 
-As versões atuais do DVWA inserem um campo oculto **`user_token`** (anti-CSRF) no formulário de login. Sem esse token, o servidor rejeita a tentativa — e o Medusa **não resolve o token sozinho**. Resultado: o comando acima falha mesmo com a senha correta.
+**1. Módulo errado = falsos-positivos.** A primeira tentativa usou o módulo `http` com opções de formulário: ele ignorou as opções (`WARNING: Invalid method`) e classificou **dezenas de combinações erradas como `[SUCCESS]`** — a resposta 200 com "Login failed" enganou o módulo. `ACCOUNT FOUND` sem validação manual não vale nada.
 
-Isso não é um bug do Medusa: é **a mitigação funcionando**. Alternativas para estudo:
+**2. Token CSRF bloqueia o brute force ingênuo.** O formulário de login do DVWA carrega um campo oculto **`user_token`** (anti-CSRF). Sem o token, o servidor responde **HTTP 302** (redirecionamento) e rejeita a tentativa — mesmo com a senha correta. Com o módulo `web-form` na sintaxe correta, o Medusa percorreu as combinações e terminou com **0 `ACCOUNT FOUND`**: cada tentativa morreu no 302.
+
+**3. A credencial válida continua válida — o que trava é o token.** Controle manual com `curl`:
+
+```bash
+# extrai o token da página de login (com cookie de sessão)
+TOKEN=$(curl -s -c c.txt http://192.168.56.20/login.php \
+        | grep -oP "name='user_token' value='\K[a-f0-9]+")
+
+# POST sem token               -> 302 para login.php (bloqueado)
+# POST com token + senha errada -> 302 para login.php
+curl -s -b c.txt -d "username=admin&password=password&Login=Login&user_token=$TOKEN" \
+     http://192.168.56.20/login.php
+# POST com token + admin:password -> 302 para index.php ("Welcome to DVWA") ✔
+```
+
+Isso não é um bug do Medusa: é **a mitigação funcionando**. Para automatizar a quebra seria preciso extrair o token a cada requisição:
 
 1. **Burp Suite → Intruder** em modo *Pitchfork*, com extração do `user_token` de cada resposta;
-2. Script próprio (ex.: Python `requests`) que faz *GET* no login, extrai o token com regex e envia o *POST* com ele;
-3. Desabilitar a verificação no código do DVWA **apenas para demonstrar o brute force puro** (e voltar depois).
+2. Script próprio (ex.: Python `requests`) que faz *GET* no login, extrai o token com regex e envia o *POST* com ele.
 
 > 🧠 **Lição:** formulários modernos com token anti-CSRF (e, mais ainda, com MFA) quebram o brute force "ingênuo" de formulário. A defesa ganha, mas o atacante adapta — por isso auditoria exige entender a aplicação, não só disparar ferramenta.
 
@@ -400,6 +416,19 @@ Um `ACCOUNT FOUND` não é sinônimo de acesso. Cuidados que apliquei no lab:
 
 ---
 
+## 🖥️ Ambiente das evidências (Docker)
+
+O tutorial acima usa **VirtualBox + Kali + Metasploitable 2** — e é o ambiente recomendado. Para produzir as evidências deste repositório, porém, o lab foi executado em um **equivalente 100% isolado com Docker** (a máquina usada não tinha VirtualBox instalado; instalar o hipervisor não era necessário para o objetivo do teste). O desafio da DIO é flexível a adaptações — e a lógica do ataque é idêntica.
+
+| Papel (tutorial) | Equivalente usado | Observação |
+|---|---|---|
+| Rede host-only `192.168.56.0/24` | rede Docker `medusa-lab-net` (bridge isolada, sem porta publicada no host) | mesmo isolamento |
+| Metasploitable 2 (`192.168.56.20`) | container `msf2` — imagem `tleemcjr/metasploitable2` (`172.20.0.2`) | Ubuntu 8.04 com Samba 3.0.20, ProFTPD (21), vsftpd 2.3.4 (2121), Apache 2 |
+| Kali Linux (`192.168.56.10`) | container `kali-attacker` — `kalilinux/kali-rolling` (`172.20.0.3`) | medusa, smbclient, enum4linux, nmap, lftp |
+| DVWA (no Metasploitable) | container `dvwa` — `vulnerables/web-dvwa` | mesma aplicação vulnerável |
+
+> 📸 Os PNGs em [`images/`](images/) são **renders das saídas reais** capturadas nos terminais desse lab (conteúdo autêntico, formatação visual apenas para leitura). Os logs brutos ficam em `results/` (não versionados).
+
 ## 📸 Evidências
 
 As capturas de tela devem ficar em [`images/`](images/):
@@ -414,7 +443,7 @@ As capturas de tela devem ficar em [`images/`](images/):
 | 06 | `06-smbclient-list.png` | `smbclient -L` | Validação |
 | 07 | `07-smbclient-tmp.png` | `ls` dentro do share | Validação |
 | 08 | `08-medusa-ftp.png` | Acerto no FTP | Bônus FTP |
-| 09 | `09-dvwa-login.png` | Tentativas no DVWA | Bônus DVWA |
+| 09 | `09-dvwa-login.png` | `user_token` no formulário, Medusa bloqueado (302) e controle com token | Bônus DVWA |
 
 ---
 
